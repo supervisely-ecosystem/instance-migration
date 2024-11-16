@@ -4,17 +4,16 @@ import json
 import math
 import os
 import shutil
+import time
 from collections import defaultdict
 from functools import partial
 from typing import List, Optional, Union
 
 import aiofiles
-import msgpack
 import supervisely as sly
 from supervisely.api.api import ApiField
 from supervisely.api.image_api import ImageApi
 from supervisely.api.video.video_api import VideoApi, VideoInfo
-from tenacity import before_sleep_log, retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as tqdm_async
 
@@ -27,9 +26,9 @@ entities_map = {}
 api = sly.Api.from_env()
 
 # ------------------------------------ Constants For Migration ----------------------------------- #
-os.environ["GM_REMOTE"] = os.path.expanduser("~/Work/GM")
+os.environ["MIGRATION_REMOTE"] = os.path.expanduser("~/Work/instance_migration")
 os.environ["SLY_DIR"] = "sly"
-GM_REMOTE = os.getenv("GM_REMOTE")  # TODO Change to your remote storage path
+GM_REMOTE = os.getenv("MIGRATION_REMOTE")  # TODO Change to your remote storage path
 SLY_DIR = os.getenv("SLY_DIR")  # TODO Change to your remote SLY storage directory
 
 # ----------------------------- Asynchronous Functions For Migration ----------------------------- #
@@ -44,15 +43,19 @@ class HashMismatchError(Exception):
 
 class ProjectItemsMap:
 
-    def __init__(self, api: sly.Api, project_id: str):
+    def __init__(self, api: sly.Api, project_id: int):
         self.structure = defaultdict(dict)
         self.api = api
         self.project_id = project_id
         self.file_path = os.path.join(GM_REMOTE, SLY_DIR, f"{project_id}.json")
         self.lock = asyncio.Lock()
+        self.buffer = {}
+        self.buffer_size = 100
+        self.last_flush_time = time.time()
+        self.flush_interval = 60
         self.api_semaphore = asyncio.Semaphore(10)
         self.loop = sly.utils.get_or_create_event_loop()
-        self.loop.create_task(self.initialize())
+        self.loop.run_until_complete(self.initialize())
 
     async def initialize(self):
         await self.load_from_file()
@@ -71,20 +74,31 @@ class ProjectItemsMap:
             else:
                 sly.fs.ensure_base_path(self.file_path)
 
-    async def update_file(self, key: str, value: dict):
+    async def flush_buffer(self):
         async with self.lock:
-            if os.path.exists(self.file_path):
-                async with aiofiles.open(self.file_path, "r+") as f:
-                    content = await f.read()
-                    data = json.loads(content) if content.strip() else {}
-                    data[str(key)] = value  # Convert key to string
+            if self.buffer:
+                if os.path.exists(self.file_path):
+                    async with aiofiles.open(self.file_path, "r+") as f:
+                        content = await f.read()
+                        data = json.loads(content) if content.strip() else {}
+                        data.update(self.buffer)
 
-                    # Write only the updated data back to the file
-                    await f.seek(0)
-                    await f.write(json.dumps(data, indent=4))
-                    await f.truncate()
-            else:
-                await self.dump_to_file()
+                        # Write only the updated data back to the file
+                        await f.seek(0)
+                        await f.write(json.dumps(data, indent=4))
+                        await f.truncate()
+                else:
+                    await self.dump_to_file()
+                self.buffer.clear()
+                self.last_flush_time = time.time()
+
+    async def update_file(self, key: str, value: dict):
+        self.buffer[str(key)] = value  # Convert key to string
+        if (
+            len(self.buffer) >= self.buffer_size
+            or (time.time() - self.last_flush_time) >= self.flush_interval
+        ):
+            await self.flush_buffer()
 
     async def run_in_executor(self, func, *args):
         loop = sly.utils.get_or_create_event_loop()
@@ -110,7 +124,7 @@ class ProjectItemsMap:
 
     def list_items_batched(self, dataset_info: sly.DatasetInfo, project_type: str):
         items_api = self.detect_api(project_type)
-        fields = [ApiField.ID, ApiField.NAME, ApiField.PATH_ORIGINAL, ApiField.DATASET_ID]
+        fields = [ApiField.ID, ApiField.TITLE, ApiField.PATH_ORIGINAL, ApiField.DATASET_ID]
 
         # loop = sly.utils.get_or_create_event_loop()
         items = self.loop.run_until_complete(
@@ -137,6 +151,9 @@ class ProjectItemsMap:
         items = self.list_items_batched(dataset_info, project.type)
 
         async def process_item(item: Union[sly.ImageInfo, VideoInfo], dataset_progress: tqdm):
+            if self.structure.get(str(item.id), {"status": None}).get("status") == "success":
+                dataset_progress.update(1)
+                return
             item_id = str(item.id)
             item_path = os.path.join(dataset_dir, f"{item_id}-{item.name}")
             item_dict = {
@@ -204,11 +221,11 @@ async def get_list_optimized(
     """
     tasks = []
     total_pages = math.ceil(dataset_info.items_count / per_page)
+    method = "images.list" if isinstance(item_api, ImageApi) else "videos.list"
     if loop is None:
         loop = sly.utils.get_or_create_event_loop()
     for page_num in range(1, total_pages + 1):
         data = {
-            ApiField.PROJECT_ID: dataset_info.project_id,
             ApiField.DATASET_ID: dataset_info.id,
             ApiField.SORT: "id",
             ApiField.SORT_ORDER: "asc",
@@ -218,7 +235,8 @@ async def get_list_optimized(
         }
         if fields is not None:
             data[ApiField.FIELDS] = fields
-        method = "images.list" if isinstance(item_api, ImageApi) else "videos.list"
+        if method == "images.list":
+            data[ApiField.PROJECT_ID] = dataset_info.project_id
         async with semaphore:
             task = get_list_idx_page(item_api, method, data)
             tasks.append(task)
@@ -279,6 +297,7 @@ def collect_project_items_and_move():
                     project_map = ProjectItemsMap(api, project.id)
                     dataset = flatten_datasets_structure[dataset]
                     project_map.move_items(dataset, project, workspace, team)
+            sly.logger.debug(f"Items map is saved for project ID: {project.id}")
 
 
 if __name__ == "__main__":
@@ -287,8 +306,9 @@ if __name__ == "__main__":
         try:
             # ------------------------------------ Start Migration Process ------------------------------------ #
             collect_project_items_and_move()
-            print("Backup of mapping structure is saved to mapping_structure.json")
+            # map = ProjectItemsMap(api, 286321)
+
         except KeyboardInterrupt:
-            print("Migration process was interrupted by the user.")
+            sly.logger.info("Migration process was interrupted by the user.")
 
     main()
