@@ -1,4 +1,6 @@
+import argparse
 import asyncio
+import base64
 import hashlib
 import json
 import math
@@ -14,6 +16,7 @@ import supervisely as sly
 from supervisely.api.api import ApiField
 from supervisely.api.image_api import ImageApi
 from supervisely.api.video.video_api import VideoApi, VideoInfo
+from tenacity import before_sleep_log, retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
 from tqdm.asyncio import tqdm as tqdm_async
 
@@ -26,11 +29,17 @@ entities_map = {}
 api = sly.Api.from_env()
 
 # ------------------------------------ Constants For Migration ----------------------------------- #
-os.environ["MIGRATION_REMOTE"] = os.path.expanduser("~/Work/instance_migration")
-os.environ["SLY_DIR"] = "sly"
-GM_REMOTE = os.getenv("MIGRATION_REMOTE")  # TODO Change to your remote storage path
-SLY_DIR = os.getenv("SLY_DIR")  # TODO Change to your remote SLY storage directory
 
+IM_DIR_R = os.getenv("IM_DIR_R")  # TODO Change to your NAS storage path
+SLYM_DIR_R = os.getenv("SLYM_DIR_R")  # TODO Change to your NAS SLY storage directory
+MAX_RETRY_ATTEMPTS = os.getenv(
+    "MAX_RETRY_ATTEMPTS", 3
+)  # Maximum number of retry attempts for failed items
+MAPS_DIR_L = os.path.join(IM_DIR_R, SLYM_DIR_R, "maps")  # local path to store the maps
+MAPS_DIR_R = os.path.join(IM_DIR_R, SLYM_DIR_R, "maps")  # remote path to store the maps
+FAILED_PROJECTS_FILE = os.path.join(  # file with failed projects to retry
+    MAPS_DIR_L, "failed_projects.json"
+)
 # ----------------------------- Asynchronous Functions For Migration ----------------------------- #
 
 
@@ -47,15 +56,17 @@ class ProjectItemsMap:
         self.structure = defaultdict(dict)
         self.api = api
         self.project_id = project_id
-        self.file_path = os.path.join(GM_REMOTE, SLY_DIR, f"{project_id}.json")
+        self.file_path = os.path.join(MAPS_DIR_L, f"{project_id}.json")
         self.lock = asyncio.Lock()
         self.buffer = {}
         self.buffer_size = 100
         self.last_flush_time = time.time()
-        self.flush_interval = 60
+        self.flush_interval = 20
         self.api_semaphore = asyncio.Semaphore(10)
         self.loop = sly.utils.get_or_create_event_loop()
         self.loop.run_until_complete(self.initialize())
+        self.failed_items = []  # to collect failed items Info while processing
+        self.ds_retry_attempt = 0  # number of retry attempts for failed items in DS
 
     async def initialize(self):
         await self.load_from_file()
@@ -104,7 +115,8 @@ class ProjectItemsMap:
         loop = sly.utils.get_or_create_event_loop()
         return await loop.run_in_executor(None, func, *args)
 
-    async def calculate_hash(self, file_path: str) -> str:
+    @staticmethod
+    async def calculate_hash(file_path: str) -> str:
         hash_algo = hashlib.sha256()
         async with aiofiles.open(file_path, "rb") as f:
             while True:
@@ -112,10 +124,10 @@ class ProjectItemsMap:
                 if not chunk:
                     break
                 hash_algo.update(chunk)
-        return hash_algo.hexdigest()
+        return base64.b64encode(hash_algo.digest()).decode("utf-8")
 
-    async def move_to_nas(self, local_path: str, nas_path: str, hash_value: str = None):
-        shutil.move(local_path, nas_path)
+    async def copy_to_nas(self, local_path: str, nas_path: str, hash_value: str = None):
+        shutil.copy(local_path, nas_path)
         sly.logger.debug(f"Moved file from {local_path} to {nas_path}")
         if hash_value:
             remote_hash = await self.calculate_hash(nas_path)
@@ -139,16 +151,20 @@ class ProjectItemsMap:
         )
         return items
 
-    def move_items(
+    def copy_items(
         self,
-        dataset: dict,
+        dataset: dict,  # dataset: {"path": str, "info": sly.DatasetInfo}
         project: sly.ProjectInfo,
-        workspace: sly.WorkspaceInfo,
-        team: sly.TeamInfo,
-    ):
+        workspace_id: int,
+        team_id: int,
+        fix_failed: bool = False,
+    ) -> List[Union[sly.ImageInfo, VideoInfo]]:  # list of failed items to retry
         dataset_dir = dataset.get("path")
         dataset_info: sly.DatasetInfo = dataset.get("info")
-        items = self.list_items_batched(dataset_info, project.type)
+        if fix_failed:
+            items = self.failed_items
+        else:
+            items = self.list_items_batched(dataset_info, project.type)
 
         async def process_item(item: Union[sly.ImageInfo, VideoInfo], dataset_progress: tqdm):
             if self.structure.get(str(item.id), {"status": None}).get("status") == "success":
@@ -162,23 +178,31 @@ class ProjectItemsMap:
                 "src_path": item.path_original,
                 "dataset_id": dataset_info.id,
                 "project_id": project.id,
-                "workspace_id": workspace.id,
-                "team_id": team.id,
+                "workspace_id": workspace_id,
+                "team_id": team_id,
             }
             try:
-                await self.move_to_nas(item.path_original, item_path, item.hash)
+                await self.copy_to_nas(item.path_original, item_path, item.hash)
                 item_dict["status"] = "success"
             except Exception:
+                if item not in self.failed_items:
+                    self.failed_items.append(item)
                 item_dict["status"] = "failed"
                 sly.logger.debug(f"Failed to move item {item_id} to NAS")
             finally:
                 await self.update_file(item_id, item_dict)
             dataset_progress.update(1)
 
-        dataset_progress = tqdm(total=len(items), desc=f"Process items in dataset", leave=False)
-        item_tasks = [process_item(item, dataset_progress) for item in items]
-        self.loop.run_until_complete(asyncio.gather(*item_tasks))
-        dataset_progress.close()
+        if len(items) > 0:
+            filtered_items = [item for item in items if item.link is None]
+            dataset_progress = tqdm(
+                total=len(filtered_items), desc=f"Process items in dataset", leave=False
+            )
+            item_tasks = [process_item(item, dataset_progress) for item in filtered_items]
+            self.loop.run_until_complete(asyncio.gather(*item_tasks))
+            dataset_progress.close()
+        else:
+            sly.logger.debug(f"No items found for dataset ID: {dataset_info.id}")
 
     def detect_api(self, project_type: str):
         if project_type == "images":
@@ -189,11 +213,17 @@ class ProjectItemsMap:
             raise ValueError(f"Project type '{project_type}' is not supported")
 
 
-async def get_list_idx_page(item_api: Union[ImageApi, VideoApi], method: str, data: dict):
-    response = await api.post_async(method, data)
-    results = response.json().get("entities", [])
-    convert_func = item_api._convert_json_info
-    return [convert_func(item) for item in results]
+async def get_list_idx_page(
+    item_api: Union[ImageApi, VideoApi],
+    method: str,
+    data: dict,
+    semaphore: asyncio.Semaphore,
+):
+    async with semaphore:
+        response = await api.post_async(method, data)
+        results = response.json().get("entities", [])
+        convert_func = item_api._convert_json_info
+        return [convert_func(item) for item in results]
 
 
 async def get_list_optimized(
@@ -237,8 +267,7 @@ async def get_list_optimized(
             data[ApiField.FIELDS] = fields
         if method == "images.list":
             data[ApiField.PROJECT_ID] = dataset_info.project_id
-        async with semaphore:
-            task = get_list_idx_page(item_api, method, data)
+            task = get_list_idx_page(item_api, method, data, semaphore)
             tasks.append(task)
     items = await asyncio.gather(*tasks)
     return [item for sublist in items for item in sublist]
@@ -249,7 +278,7 @@ def filter_projects(projects: List[sly.ProjectInfo], types=["images", "videos"])
 
 
 def get_team_dir(team: sly.TeamInfo) -> str:
-    return os.path.join(GM_REMOTE, SLY_DIR, f"{team.id}-{team.name}")
+    return os.path.join(IM_DIR_R, SLYM_DIR_R, f"{team.id}-{team.name}")
 
 
 def get_workspace_dir(workspace: sly.WorkspaceInfo, team_dir: str) -> str:
@@ -291,24 +320,99 @@ def collect_project_items_and_move():
             projects = api.project.get_list(workspace.id)
             projects_filtered = filter_projects(projects)
             for project in tqdm(projects_filtered, desc="Projects", leave=False):
+                project_map = ProjectItemsMap(api, project.id)
                 project_dir = get_project_dir(project, workspace_dir)
                 flatten_datasets_structure = get_datasets(project, project_dir)
                 for dataset in tqdm(flatten_datasets_structure, desc="Datasets", leave=False):
-                    project_map = ProjectItemsMap(api, project.id)
+                    project_map.ds_retry_attempt = 0
                     dataset = flatten_datasets_structure[dataset]
-                    project_map.move_items(dataset, project, workspace, team)
-            sly.logger.debug(f"Items map is saved for project ID: {project.id}")
+                    project_map.copy_items(dataset, project, workspace.id, team.id)
+                    while (
+                        project_map.ds_retry_attempt < MAX_RETRY_ATTEMPTS
+                        and len(project_map.failed_items) > 0
+                    ):
+                        project_map.copy_items(
+                            dataset, project, workspace.id, team.id, fix_failed=True
+                        )
+                if project_map.failed_items:
+                    if os.path.exists(FAILED_PROJECTS_FILE):
+                        with open(FAILED_PROJECTS_FILE, "r") as f:
+                            failed_projects = json.load(f)
+                    else:
+                        failed_projects = {}
+                    failed_projects[project.id] = project_dir
+                    with open(FAILED_PROJECTS_FILE, "w") as f:
+                        json.dump(failed_projects, f, indent=4)
+                    sly.logger.warning(
+                        f"Failed to process {len(project_map.failed_items)} item(s) in project ID: {project.id}, "
+                        f"to retry please run the script again with 'only_failed' parameter after this run."
+                    )
+                sly.logger.debug(f"Items map is saved for project ID: {project.id}")
+
+
+def process_failed_projects():
+    if os.path.exists(FAILED_PROJECTS_FILE):
+        with open(FAILED_PROJECTS_FILE, "r") as f:
+            failed_projects = json.load(f)
+        project_ids = list(failed_projects.keys())
+        if len(project_ids) > 0:
+            sly.logger.info("Processing failed items in projects...")
+            projects = api.project.get_list(project_ids)
+
+            for project, project_dir in tqdm(projects, desc="Projects"):
+                project: sly.ProjectInfo
+                project_map = ProjectItemsMap(api, project.id)
+                workspace_id = project.workspace_id
+                team_id = project.team_id
+                flatten_datasets_structure = get_datasets(project, project_dir)
+                for dataset in tqdm(flatten_datasets_structure, desc="Datasets", leave=False):
+                    project_map.ds_retry_attempt = 0
+                    dataset = flatten_datasets_structure[dataset]
+                    project_map.copy_items(dataset, project, workspace_id, team_id, fix_failed=True)
+                    while (
+                        project_map.ds_retry_attempt < MAX_RETRY_ATTEMPTS
+                        and len(project_map.failed_items) > 0
+                    ):
+                        project_map.copy_items(
+                            dataset, project, workspace_id, team_id, fix_failed=True
+                        )
+                if project_map.failed_items:
+                    sly.logger.warning(
+                        f"Failed to process {len(project_map.failed_items)} item(s) in project ID: {project.id}, "
+                        f"to retry please run the script again with 'only_failed' parameter after this run."
+                    )
+                else:
+                    del failed_projects[project.id]
+                    with open(FAILED_PROJECTS_FILE, "w") as f:
+                        json.dump(failed_projects, f, indent=4)
+                sly.logger.debug(f"Items map is saved for project ID: {project.id}")
+    else:
+        sly.logger.info("No failed projects found to retry.")
+
+
+def copy_maps_to_nas(local_path: str, nas_path: str):
+    try:
+        shutil.copytree(local_path, nas_path)
+        sly.logger.info(f"Maps are copied to NAS: {nas_path}")
+    except Exception as e:
+        sly.logger.warning(f"Maps are not copied to NAS, error: {e}")
+
+
+def main(only_failed: bool = False):
+    try:
+        if only_failed:
+            process_failed_projects()
+        else:
+            collect_project_items_and_move()
+            # map = ProjectItemsMap(api, 286321)
+            copy_maps_to_nas(MAPS_DIR_L, MAPS_DIR_R)
+
+    except KeyboardInterrupt:
+        sly.logger.info("Migration process was interrupted by the user.")
 
 
 if __name__ == "__main__":
-
-    def main():
-        try:
-            # ------------------------------------ Start Migration Process ------------------------------------ #
-            collect_project_items_and_move()
-            # map = ProjectItemsMap(api, 286321)
-
-        except KeyboardInterrupt:
-            sly.logger.info("Migration process was interrupted by the user.")
-
-    main()
+    parser = argparse.ArgumentParser(description="Process some projects.")
+    parser.add_argument("--only_failed", action="store_true", help="Process only failed items")
+    args = parser.parse_args()
+    main(only_failed=args.only_failed)
