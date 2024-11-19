@@ -38,3 +38,5 @@ Thumbs.db
 build/
 dist/
 *.egg-info/
+
+/sly
