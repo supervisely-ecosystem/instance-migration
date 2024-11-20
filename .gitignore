@@ -14,6 +14,7 @@ env/
 
 # Ignore log files
 *.log
+/logs
 
 # Ignore database files
 *.sqlite3

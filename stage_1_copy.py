@@ -13,37 +13,25 @@ from typing import List, Optional, Union
 
 import aiofiles
 import aiofiles.os
-from dotenv import load_dotenv
 from json_repair import repair_json
 from supervisely.api.api import ApiField
 from supervisely.api.image_api import ImageApi
 from supervisely.api.video.video_api import VideoApi, VideoInfo
-from supervisely.sly_logger import add_default_logging_into_file
 from tenacity import before_sleep_log, retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
 
-import config
 import supervisely as sly
-
-# ---------------------------------------- Supervisely API --------------------------------------- #
-api = sly.Api.from_env()
-# --------------------------------------------- ENVs --------------------------------------------- #
-load_dotenv("local.env")
-# -------------------------------------------- Config -------------------------------------------- #
-DEBUG_LEVEL = config.DEBUG_LEVEL
-STORAGE = config.STORAGE
-IM_DIR_R = config.IM_DIR_R
-SLYM_DIR_R = config.SLYM_DIR_R
-MAX_RETRY_ATTEMPTS = config.MAX_RETRY_ATTEMPTS
-
-MAPS_DIR_L = config.MAPS_DIR_L
-MAPS_DIR_R = config.MAPS_DIR_R
-LOGS_DIR = config.LOGS_DIR
-# ---------------------------------------- Logger Settings --------------------------------------- #
-logger = api.logger
-logger.setLevel(DEBUG_LEVEL)
-add_default_logging_into_file(logger, LOGS_DIR)
-# ------------------------------------------------------------------------------------------------ #
+from config import (
+    DATA_PATH,
+    IM_DIR_R,
+    MAPS_DIR_L,
+    MAPS_DIR_R,
+    MAX_RETRY_ATTEMPTS,
+    SLYM_DIR_R,
+    STORAGE_DIR_NAME,
+    api,
+    logger,
+)
 
 
 class HashMismatchError(Exception):
@@ -54,7 +42,7 @@ class HashMismatchError(Exception):
 
 
 class ProjectItemsMap:
-    """Class to manage project items mapping and copy items to NAS"""
+    """Class to manage project items mapping and copy items to destination storage"""
 
     def __init__(self, api: sly.Api, project_id: int, project_type: str = None):
         self.structure = {}
@@ -74,7 +62,10 @@ class ProjectItemsMap:
         self.failed_items = {}  # to collect failed items while processing
         self.ds_retry_attempt = 0  # number of retry attempts for failed items in DS
         self.loop = sly.utils.get_or_create_event_loop()
-        self.loop.run_until_complete(self.initialize())
+        if self.loop.is_running():
+            asyncio.create_task(self.initialize())
+        else:
+            asyncio.run(self.initialize())
 
     async def initialize(self):
         """Initialize the project items map from the file"""
@@ -180,14 +171,7 @@ class ProjectItemsMap:
             dst_path = item_dict.get("dst_path")
             hash_value = item_dict.get("hash")
             await aiofiles.os.makedirs(os.path.dirname(dst_path), exist_ok=True)
-            async with aiofiles.open(src_path, "rb") as src_file:
-                async with aiofiles.open(dst_path, "wb") as dst_file:
-                    while True:
-                        chunk = await src_file.read(8192)
-                        if not chunk:
-                            break
-                        await dst_file.write(chunk)
-            # shutil.copy(src_path, dst_path)
+            shutil.copy(src_path, dst_path)
             logger.trace(f"Moved file from {src_path} to {dst_path}")
             if not hash_value:
                 local_hash = await self.calculate_hash(src_path)
@@ -263,7 +247,9 @@ class ProjectItemsMap:
             item_dict = {
                 "name": item.name,
                 "dst_path": item_path,
-                "src_path": os.path.join(STORAGE, item.path_original.lstrip("/")),
+                "src_path": os.path.join(
+                    DATA_PATH, STORAGE_DIR_NAME, item.path_original.lstrip("/")
+                ),
                 "dataset_id": dataset_info.id,
                 "project_id": project.id,
                 "workspace_id": workspace_id,
@@ -277,7 +263,7 @@ class ProjectItemsMap:
                 if item.id not in self.failed_items:
                     self.failed_items[item.id] = item_dict
                 item_dict["status"] = "failed"
-                logger.trace(f"Failed to copy item {item_id} to NAS: {e}")
+                logger.trace(f"Failed to copy item {item_id} to dst: {e}")
             finally:
                 await self.update_file(item_id, item_dict)
             dataset_progress.update(1)
@@ -302,7 +288,7 @@ class ProjectItemsMap:
                 item_info["status"] = "success"
             except Exception as e:
                 item_info["status"] = "failed"
-                logger.trace(f"Failed to copy item {item_id} to NAS: {e}")
+                logger.trace(f"Failed to copy item {item_id} to dst: {e}")
             finally:
                 await self.update_file(item_id, item_info)
             project_progress.update(1)
@@ -432,6 +418,8 @@ async def get_list_optimized(
             ApiField.PAGE: page_num,
         }
         if fields is not None:
+            if method == "videos.list":
+                fields.extend(["dataId", "remoteDataId"])  # TODO revome after API fix
             data[ApiField.FIELDS] = fields
         if method == "images.list":
             data[ApiField.PROJECT_ID] = dataset_info.project_id
@@ -615,7 +603,7 @@ async def process_failed_projects():
         raise
 
 
-def copy_maps_to_nas(local_path: str, dst_path: str):
+def copy_maps_to_dst(local_path: str, dst_path: str):
     """Copy project maps to destination directory after processing
 
     :param local_path: Local path to the project maps
@@ -628,9 +616,9 @@ def copy_maps_to_nas(local_path: str, dst_path: str):
             backup_path = f"{dst_path}_backup_{datetime.now().strftime('%Y%m%d%H%M%S')}"
             shutil.move(dst_path, backup_path)
         shutil.copytree(local_path, dst_path)
-        logger.info(f"Maps are copied to NAS: {dst_path}")
+        logger.info(f"Maps are copied to destination folder: {dst_path}")
     except Exception as e:
-        logger.warning(f"Maps are not copied to NAS, error: {e}")
+        logger.warning(f"Maps are not copied to destination folder, error: {e}")
 
 
 def main(only_failed: bool = False):
@@ -640,7 +628,7 @@ def main(only_failed: bool = False):
             loop.run_until_complete(process_failed_projects())
         else:
             loop.run_until_complete(collect_project_items_and_move())
-            copy_maps_to_nas(MAPS_DIR_L, MAPS_DIR_R)
+            copy_maps_to_dst(MAPS_DIR_L, MAPS_DIR_R)
 
     except KeyboardInterrupt:
         logger.info("Script was stopped by the user.")
