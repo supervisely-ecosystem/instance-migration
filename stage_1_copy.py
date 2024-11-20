@@ -6,8 +6,8 @@ import json
 import math
 import os
 import shutil
+from datetime import datetime
 import time
-from collections import defaultdict
 from typing import List, Optional, Union
 
 import aiofiles
@@ -22,27 +22,24 @@ from supervisely.api.video.video_api import VideoApi, VideoInfo
 from tqdm import tqdm
 
 # -------------------------------- Global Variables For Migration -------------------------------- #
-
-entity_api = None
-download_api_url = None
 entities_map = {}
 
 api = sly.Api.from_env()
 load_dotenv("local.env")
 # ------------------------------------ Constants For Migration ----------------------------------- #
-
+DEBUG_LEVEL = os.getenv("DEBUG_LEVEL", "INFO")
+STORAGE = os.getenv("SLY_SERVER_STORAGE")  # TODO Change to your NAS storage path
 IM_DIR_R = os.getenv("IM_DIR_R")  # TODO Change to your NAS storage path
 SLYM_DIR_R = os.getenv("SLYM_DIR_R")  # TODO Change to your NAS SLY storage directory
 MAX_RETRY_ATTEMPTS = int(
-    os.getenv("MAX_RETRY_ATTEMPTS", 3)
+    os.getenv("MAX_RETRY_ATTEMPTS", "3")
 )  # Maximum number of retry attempts for failed items
 MAPS_DIR_L = os.path.join(os.getcwd(), SLYM_DIR_R, "maps")  # local path to store the maps
 MAPS_DIR_R = os.path.join(IM_DIR_R, SLYM_DIR_R, "maps")  # remote path to store the maps
-FAILED_PROJECTS_FILE = os.path.join(  # file with failed projects to retry
-    MAPS_DIR_L, "failed_projects.json"
-)
 # ----------------------------- Asynchronous Functions For Migration ----------------------------- #
 
+# api.logger.setLevel(DEBUG_LEVEL)
+api.logger.setLevel("TRACE")
 
 class HashMismatchError(Exception):
     def __init__(self, expected_hash, remote_hash):
@@ -132,6 +129,7 @@ class ProjectItemsMap:
         src_path = item_dict.get("src_path")
         dst_path = item_dict.get("dst_path")
         hash_value = item_dict.get("hash")
+        sly.fs.ensure_base_path(dst_path)
         shutil.copy(src_path, dst_path)
         sly.logger.debug(f"Moved file from {src_path} to {dst_path}")
         if not hash_value:
@@ -178,7 +176,7 @@ class ProjectItemsMap:
             item_dict = {
                 "name": item.name,
                 "dst_path": item_path,
-                "src_path": item.path_original,
+                "src_path": os.path.join(STORAGE, item.path_original.lstrip("/")),
                 "dataset_id": dataset_info.id,
                 "project_id": project.id,
                 "workspace_id": workspace_id,
@@ -188,11 +186,11 @@ class ProjectItemsMap:
             try:
                 await self.copy_to_nas(item_dict)
                 item_dict["status"] = "success"
-            except Exception:
+            except Exception as e:
                 if item.id not in self.failed_items:
                     self.failed_items[item.id] = item_dict
                 item_dict["status"] = "failed"
-                sly.logger.trace(f"Failed to move item {item_id} to NAS")
+                sly.logger.trace(f"Failed to copy item {item_id} to NAS: {e}")
             finally:
                 await self.update_file(item_id, item_dict)
             dataset_progress.update(1)
@@ -209,16 +207,13 @@ class ProjectItemsMap:
             sly.logger.debug(f"No items found for dataset ID: {dataset_info.id}")
 
     def copy_failed_items(self):
-        async def process_item(item_id: int, item_info: dict, project_progress: tqdm):
-            src_path = item_info.get("src_path")
-            dst_path = item_info.get("dst_path")
-            item_hash = item_info.get("hash")
+        async def process_item(item_id: int, item_info: dict, project_progress: tqdm):            
             try:
-                await self.copy_to_nas(src_path, dst_path, item_hash)
+                await self.copy_to_nas(item_info)
                 self.failed_items.pop(item_id)
                 await self.update_file(item_id, item_info)
-            except Exception:
-                sly.logger.trace(f"Failed to move item {item_id} to NAS")
+            except Exception as e:
+                sly.logger.trace(f"Failed to copy item {item_id} to NAS: {e}")
             project_progress.update(1)
 
         project_progress = tqdm(
@@ -309,8 +304,8 @@ async def get_list_optimized(
             data[ApiField.FIELDS] = fields
         if method == "images.list":
             data[ApiField.PROJECT_ID] = dataset_info.project_id
-            task = get_list_idx_page(item_api, method, data, semaphore)
-            tasks.append(task)
+        task = get_list_idx_page(item_api, method, data, semaphore)
+        tasks.append(task)
     items = await asyncio.gather(*tasks)
     return [item for sublist in items for item in sublist]
 
@@ -458,6 +453,9 @@ def process_failed_projects():
 
 def copy_maps_to_nas(local_path: str, nas_path: str):
     try:
+        if os.path.exists(nas_path):
+            backup_path = f"{nas_path}_backup_{datetime.now().strftime('%Y%m%d%H%M%S')}"
+            shutil.move(nas_path, backup_path)
         shutil.copytree(local_path, nas_path)
         sly.logger.info(f"Maps are copied to NAS: {nas_path}")
     except Exception as e:
