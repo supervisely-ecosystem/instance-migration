@@ -298,9 +298,9 @@ class ProjectItemsMap:
         :return: API object
         :rtype: Union[ImageApi, VideoApi]
         """
-        if project_type == "images":
+        if project_type == sly.ProjectType.IMAGES:
             return self.api.image
-        elif project_type == "videos":
+        elif project_type == sly.ProjectType.VIDEOS:
             return self.api.video
         else:
             raise ValueError(f"Project type '{project_type}' is not supported")
@@ -411,7 +411,7 @@ async def get_list_optimized(
     return [item for sublist in items for item in sublist]
 
 
-def filter_projects(projects: List[sly.ProjectInfo], types=["images", "videos"]):
+def filter_projects(projects: List[sly.ProjectInfo], types=[sly.ProjectType.IMAGES, sly.ProjectType.VIDEOS]):
     return [project for project in projects if project.type in types]
 
 
@@ -479,7 +479,6 @@ async def collect_project_items_and_move():
                     for dataset in tqdm(
                         flatten_datasets_structure.values(), desc="Datasets", leave=False
                     ):
-
                         await project_map.copy_items(dataset, project, workspace.id, team.id)
                     project_map.ds_retry_attempt = 0
                     while project_map.ds_retry_attempt < MAX_RETRY and project_map.failed_items:
