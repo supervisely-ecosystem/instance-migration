@@ -1,26 +1,44 @@
 import os
 
 from dotenv import load_dotenv
-from supervisely.sly_logger import add_default_logging_into_file
-
 from supervisely import Api
 from supervisely import fs as fs
+from supervisely.sly_logger import add_default_logging_into_file
 
 api = Api.from_env()
-load_dotenv("local.env")
+
+load_dotenv("1local.env")
+
 DEBUG_LEVEL = os.getenv("DEBUG_LEVEL", "INFO")
-DATA_PATH = os.getenv("DATA_PATH", "/supervisely/data")
-IM_DIR_R = os.getenv("IM_DIR_R")
-SLYM_DIR_R = os.getenv("SLYM_DIR_R")
-SEMAPHORE_SIZE = int(os.getenv("SEMAPHORE_SIZE", "10"))  # Number of parallel threads
-MAX_RETRY_ATTEMPTS = int(
-    os.getenv("MAX_RETRY_ATTEMPTS", "3")
-)  # Maximum number of retry attempts for failed items
-MAPS_DIR_L = os.path.join(os.getcwd(), SLYM_DIR_R, "maps")  # local path to store the maps
-MAPS_DIR_R = os.path.join(IM_DIR_R, SLYM_DIR_R, "maps")  # remote path to store the maps
+
+# Path to the directory with the data on the local machine where the instance is running.
+DATA_PATH = os.getenv("DATA_PATH")
+
+# "fs endpoint" must be mounted to the same machine where the instance is running.
+# Look for it in Instance Settings -> Cloud Credentials.
+ENDPOINT_PATH = os.getenv("ENDPOINT_PATH")
+
+# Root directory name, where all the data will be stored during the Stage 1.
+ROOT_DIR_NAME = os.getenv("ROOT_DIR_NAME")
+
+# Bucket name. Look for it in Instance Settings -> Cloud Credentials.
+BUCKET_NAME = os.getenv("BUCKET_NAME")
+
+# Number of concurrent tasks to run in parallel.
+SEMAPHORE_SIZE = int(os.getenv("SEMAPHORE_SIZE", "10"))
+
+# Number of retries for failed items
+MAX_RETRY = int(os.getenv("MAX_RETRY", "3"))
+
+if None in [DATA_PATH, ENDPOINT_PATH, ROOT_DIR_NAME, BUCKET_NAME]:
+    raise ValueError("Some of the required environment variables are not set.")
+
+# Local path to store project maps
+MAPS_DIR_L = os.path.join(os.getcwd(), ROOT_DIR_NAME, "maps")
+# Destination path to move project maps
+MAPS_DIR_R = os.path.join(ENDPOINT_PATH, ROOT_DIR_NAME, "maps")
 LOGS_DIR = "./logs/"
 STORAGE_DIR_NAME = "storage"
-
 
 logger = api.logger
 logger.setLevel(DEBUG_LEVEL)
