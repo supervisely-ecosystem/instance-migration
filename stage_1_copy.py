@@ -50,9 +50,10 @@ class ProjectItemsMap:
         self.project_id = project_id
         self.project_type = project_type
         self.items_file = os.path.join(MAPS_DIR_L, f"{self.project_id}-{self.project_type}.json")
-        self.failed_items_file = os.path.join(
-            MAPS_DIR_L, f"{self.project_id}-{self.project_type}_failed.json"
-        )
+        # TODO Uncomment the following lines to save failed items additionally to a separate file
+        # self.failed_items_file = os.path.join(
+        #     MAPS_DIR_L, f"{self.project_id}-{self.project_type}_failed.json"
+        # )
         self.buffer = {}
         self.buffer_size = 400
         self.last_flush_time = time.time()
@@ -103,17 +104,20 @@ class ProjectItemsMap:
                 if os.path.exists(temp_file):
                     os.remove(temp_file)
 
-    async def update_file(self, key: str, value: dict):
+    async def update_file(self, key: str, value: dict, force_flush=False):
         """Update the file with the given key and value
         :param key: Item ID
         :type key: str
         :param value: Item Info dict
         :type value: dict
+        :param force_flush: Force flush the buffer
+        :type force_flush: bool
         """
         self.buffer[str(key)] = value
         if (
             len(self.buffer) >= self.buffer_size
             or (time.time() - self.last_flush_time) >= self.flush_interval
+            or force_flush
         ):
             logger.debug(
                 f"Flushing buffer: buffer size = {len(self.buffer)}, time since last flush = {time.time() - self.last_flush_time}"
@@ -221,6 +225,7 @@ class ProjectItemsMap:
             before_sleep=before_sleep_log(logger, logging.WARNING),
         )
         async def process_item(item: Union[sly.ImageInfo, VideoInfo], dataset_progress: tqdm):
+            force_flush = False
             item_id = str(item.id)
             if self.structure.get(item_id, {}).get("status") == "success":
                 dataset_progress.update(1)
@@ -246,9 +251,10 @@ class ProjectItemsMap:
                 if item.id not in self.failed_items:
                     self.failed_items[item.id] = item_dict
                 item_dict["status"] = "failed"
+                force_flush = True
                 logger.trace(f"Failed to copy item {item_id} to dst: {e}")
             finally:
-                await self.update_file(item_id, item_dict)
+                await self.update_file(item_id, item_dict, force_flush)
             dataset_progress.update(1)
 
         if items:
@@ -265,15 +271,17 @@ class ProjectItemsMap:
         """This method is called when there are failed items in the project after the initial copy."""
 
         async def process_item(item_id: int, item_info: dict, project_progress: tqdm):
+            force_flush = False
             try:
                 await self.copy_file_to_dst(item_info)
                 self.failed_items.pop(item_id)
                 item_info["status"] = "success"
             except Exception as e:
                 item_info["status"] = "failed"
+                force_flush = True
                 logger.trace(f"Failed to copy item {item_id} to dst: {e}")
             finally:
-                await self.update_file(item_id, item_info)
+                await self.update_file(item_id, item_info, force_flush)
             project_progress.update(1)
 
         if self.failed_items:
@@ -411,7 +419,9 @@ async def get_list_optimized(
     return [item for sublist in items for item in sublist]
 
 
-def filter_projects(projects: List[sly.ProjectInfo], types=[sly.ProjectType.IMAGES, sly.ProjectType.VIDEOS]):
+def filter_projects(
+    projects: List[sly.ProjectInfo], types=[sly.ProjectType.IMAGES, sly.ProjectType.VIDEOS]
+):
     return [project for project in projects if project.type in types]
 
 
@@ -459,8 +469,8 @@ def get_datasets(project: sly.ProjectInfo, project_dir: str) -> dict:
     return flatten_datasets_tree(dataset_tree, project_dir)
 
 
-async def collect_project_items_and_move():
-    """Collect information about all instance project items and move them to destination path.
+async def collect_and_copy_project_items():
+    """Collect information about all instance project items and copy them to destination path.
     Files will be stored in the human-readable structure.
     """
     try:
@@ -484,25 +494,26 @@ async def collect_project_items_and_move():
                     while project_map.ds_retry_attempt < MAX_RETRY and project_map.failed_items:
                         await project_map.try_to_copy_failed_items()
                         project_map.ds_retry_attempt += 1
-                    if project_map.failed_items:
-                        try:
-                            with open(project_map.failed_items_file, "r") as f:
-                                failed_items_json = json.load(f)
-                        except FileNotFoundError:
-                            failed_items_json = {}
-                        except json.JSONDecodeError:
-                            logger.error(
-                                f"Failed to load JSON file {project_map.failed_items_file} due to JSONDecodeError. Attempting to fix..."
-                            )
-                            failed_items_json = load_json_file_safely(project_map.failed_items_file)
+                    # TODO Uncomment the following block to save failed items additionally to a separate file
+                    # if project_map.failed_items:
+                    #     try:
+                    #         with open(project_map.failed_items_file, "r") as f:
+                    #             failed_items_json = json.load(f)
+                    #     except FileNotFoundError:
+                    #         failed_items_json = {}
+                    #     except json.JSONDecodeError:
+                    #         logger.error(
+                    #             f"Failed to load JSON file {project_map.failed_items_file} due to JSONDecodeError. Attempting to fix..."
+                    #         )
+                    #         failed_items_json = load_json_file_safely(project_map.failed_items_file)
 
-                        failed_items_json.update(project_map.failed_items)
-                        with open(project_map.failed_items_file, "w") as f:
-                            f.write(json.dumps(failed_items_json, indent=4))
-                        logger.warning(
-                            f"Failed to process {len(project_map.failed_items)} item(s) in project ID: {project.id}, "
-                            f"to retry please run the script again with 'only_failed' parameter after this run."
-                        )
+                    #     failed_items_json.update(project_map.failed_items)
+                    #     with open(project_map.failed_items_file, "w") as f:
+                    #         f.write(json.dumps(failed_items_json, indent=4))
+                    #     logger.warning(
+                    #         f"Failed to process {len(project_map.failed_items)} item(s) in project ID: {project.id}, "
+                    #         f"to retry please run the script again with 'only_failed' parameter after this run."
+                    #     )
 
                     if project_map.buffer:
                         logger.debug(
@@ -612,7 +623,7 @@ def main(only_failed: bool = False):
         if only_failed:
             loop.run_until_complete(process_failed_projects())
         else:
-            loop.run_until_complete(collect_project_items_and_move())
+            loop.run_until_complete(collect_and_copy_project_items())
             copy_maps_to_dst(MAPS_DIR_L, MAPS_DIR_R)
 
     except KeyboardInterrupt:
@@ -620,7 +631,9 @@ def main(only_failed: bool = False):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Process projects.")
-    parser.add_argument("--only_failed", action="store_true", help="Process only failed items")
-    args = parser.parse_args()
-    main(only_failed=args.only_failed)
+    # TODO Uncomment the following block to enable option to process only failed items from the main method
+    # parser = argparse.ArgumentParser(description="Process projects.")
+    # parser.add_argument("--only_failed", action="store_true", help="Process only failed items")
+    # args = parser.parse_args()
+    # main(only_failed=args.only_failed)
+    main()
