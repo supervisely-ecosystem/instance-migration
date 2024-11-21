@@ -13,6 +13,7 @@ from typing import List, Optional, Union
 
 import aiofiles
 import aiofiles.os
+import supervisely as sly
 from json_repair import repair_json
 from supervisely.api.api import ApiField
 from supervisely.api.image_api import ImageApi
@@ -20,14 +21,13 @@ from supervisely.api.video.video_api import VideoApi, VideoInfo
 from tenacity import before_sleep_log, retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
 
-import supervisely as sly
 from config import (
     DATA_PATH,
-    IM_DIR_R,
+    ENDPOINT_PATH,
     MAPS_DIR_L,
     MAPS_DIR_R,
-    MAX_RETRY_ATTEMPTS,
-    SLYM_DIR_R,
+    MAX_RETRY,
+    ROOT_DIR_NAME,
     STORAGE_DIR_NAME,
     api,
     logger,
@@ -53,7 +53,6 @@ class ProjectItemsMap:
         self.failed_items_file = os.path.join(
             MAPS_DIR_L, f"{self.project_id}-{self.project_type}_failed.json"
         )
-        self.lock = asyncio.Lock()
         self.buffer = {}
         self.buffer_size = 400
         self.last_flush_time = time.time()
@@ -79,49 +78,30 @@ class ProjectItemsMap:
         except Exception as e:
             logger.error(f"Error initializing ProjectItemsMap: {e}")
 
-    # async def flush_buffer(self):
-    #     async with self.lock:
-    #         if self.buffer:
-    #             if os.path.exists(self.items_file):
-    #                 async with aiofiles.open(self.items_file, "r+") as f:
-    #                     content = await f.read()
-    #                     data = json.loads(content) if content.strip() else {}
-    #                     data.update(self.buffer)
-
-    #                     # Write only the updated data back to the file
-    #                     await f.seek(0)
-    #                     await f.write(json.dumps(data, indent=4))
-    #                     await f.truncate()
-    #             else:
-    #                 async with aiofiles.open(self.items_file, "w") as f:
-    #                     await f.write(json.dumps(self.buffer, indent=4))
-    #             self.buffer.clear()
-    #             self.last_flush_time = time.time()
-
-    async def flush_buffer(self):
+    def flush_buffer(self):
         """Flush the buffer with Item Infos to the file"""
-        async with self.lock:
-            if self.buffer:
-                temp_file = f"{self.items_file}.tmp"
+        if self.buffer:
+            temp_file = f"{self.items_file}.tmp"
+            try:
                 try:
-                    try:
-                        async with aiofiles.open(self.items_file, "r") as f:
-                            content = await f.read()
-                            data = json.loads(content) if content.strip() else {}
-                    except FileNotFoundError:
-                        data = {}
-                    data.update(self.buffer)
+                    with open(self.items_file, "r") as f:
+                        content = f.read()
+                        data = json.loads(content) if content.strip() else {}
+                except FileNotFoundError:
+                    data = {}
+                data.update(self.buffer)
 
-                    async with aiofiles.open(temp_file, "w") as f:
-                        await f.write(json.dumps(data, indent=4))
+                with open(temp_file, "w") as f:
+                    f.write(json.dumps(data, indent=4))
 
-                    os.replace(temp_file, self.items_file)
-                    self.buffer.clear()
-                    self.last_flush_time = time.time()
-                except Exception as e:
-                    logger.error(f"Error flushing buffer to file: {e}")
-                    if os.path.exists(temp_file):
-                        os.remove(temp_file)
+                os.replace(temp_file, self.items_file)
+                logger.debug(f"Items after flush: {len(data)}. File {self.items_file}")
+                self.buffer.clear()
+                self.last_flush_time = time.time()
+            except Exception as e:
+                logger.error(f"Error flushing buffer to file: {e}")
+                if os.path.exists(temp_file):
+                    os.remove(temp_file)
 
     async def update_file(self, key: str, value: dict):
         """Update the file with the given key and value
@@ -135,7 +115,10 @@ class ProjectItemsMap:
             len(self.buffer) >= self.buffer_size
             or (time.time() - self.last_flush_time) >= self.flush_interval
         ):
-            await self.flush_buffer()
+            logger.debug(
+                f"Flushing buffer: buffer size = {len(self.buffer)}, time since last flush = {time.time() - self.last_flush_time}"
+            )
+            self.flush_buffer()
 
     @staticmethod
     async def calculate_hash(file_path: str) -> str:
@@ -433,7 +416,7 @@ def filter_projects(projects: List[sly.ProjectInfo], types=["images", "videos"])
 
 
 def get_team_dir(team: sly.TeamInfo) -> str:
-    return os.path.join(IM_DIR_R, SLYM_DIR_R, f"{team.id}-{team.name}")
+    return os.path.join(ENDPOINT_PATH, ROOT_DIR_NAME, f"{team.id}-{team.name}")
 
 
 def get_workspace_dir(workspace: sly.WorkspaceInfo, team_dir: str) -> str:
@@ -496,12 +479,10 @@ async def collect_project_items_and_move():
                     for dataset in tqdm(
                         flatten_datasets_structure.values(), desc="Datasets", leave=False
                     ):
-                        project_map.ds_retry_attempt = 0
+
                         await project_map.copy_items(dataset, project, workspace.id, team.id)
-                    while (
-                        project_map.ds_retry_attempt < MAX_RETRY_ATTEMPTS
-                        and project_map.failed_items
-                    ):
+                    project_map.ds_retry_attempt = 0
+                    while project_map.ds_retry_attempt < MAX_RETRY and project_map.failed_items:
                         await project_map.try_to_copy_failed_items()
                         project_map.ds_retry_attempt += 1
                     if project_map.failed_items:
@@ -523,7 +504,12 @@ async def collect_project_items_and_move():
                             f"Failed to process {len(project_map.failed_items)} item(s) in project ID: {project.id}, "
                             f"to retry please run the script again with 'only_failed' parameter after this run."
                         )
-                    await project_map.flush_buffer()
+
+                    if project_map.buffer:
+                        logger.debug(
+                            f"Flushing buffer on project completion: buffer size = {len(project_map.buffer)}"
+                        )
+                        project_map.flush_buffer()
                     logger.debug(f"Items map is saved for project ID: {project.id}")
     except Exception as e:
         logger.error(f"Error in collect_project_items_and_move: {e}")
@@ -582,7 +568,7 @@ async def process_failed_projects():
                 failed_items = load_json_file_safely(file)
             project_map.failed_items = failed_items
             await project_map.try_to_copy_failed_items()
-            while project_map.ds_retry_attempt < MAX_RETRY_ATTEMPTS and project_map.failed_items:
+            while project_map.ds_retry_attempt < MAX_RETRY and project_map.failed_items:
                 await project_map.try_to_copy_failed_items()
                 project_map.ds_retry_attempt += 1
             if project_map.failed_items:
@@ -635,7 +621,7 @@ def main(only_failed: bool = False):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Process some projects.")
+    parser = argparse.ArgumentParser(description="Process projects.")
     parser.add_argument("--only_failed", action="store_true", help="Process only failed items")
     args = parser.parse_args()
     main(only_failed=args.only_failed)
