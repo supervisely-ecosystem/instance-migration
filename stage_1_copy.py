@@ -159,7 +159,7 @@ class ProjectItemsMap:
             hash_value = item_dict.get("hash")
             await aiofiles.os.makedirs(os.path.dirname(dst_path), exist_ok=True)
             shutil.copy(src_path, dst_path)
-            logger.trace(f"Moved file from {src_path} to {dst_path}")
+            logger.trace(f"File copied from {src_path} to {dst_path}")
             if not hash_value:
                 local_hash = await self.calculate_hash(src_path)
                 item_dict["hash"] = local_hash
@@ -306,12 +306,23 @@ class ProjectItemsMap:
         :return: API object
         :rtype: Union[ImageApi, VideoApi]
         """
-        if project_type == sly.ProjectType.IMAGES:
+        if project_type == str(sly.ProjectType.IMAGES):
             return self.api.image
-        elif project_type == sly.ProjectType.VIDEOS:
+        elif project_type == str(sly.ProjectType.VIDEOS):
             return self.api.video
         else:
             raise ValueError(f"Project type '{project_type}' is not supported")
+
+    def log_result(self):
+        total_items = len(self.structure)
+        failed_items = len(self.failed_items)
+        successful_items = total_items - failed_items
+
+        logger.info(
+            f"Project ID: {self.project_id} - Total items: {total_items}, "
+            f"Items copied to destination folder: {successful_items}, "
+            f"Failed items: {failed_items}"
+        )
 
 
 def load_json_file_safely(file_path: str) -> dict:
@@ -420,7 +431,8 @@ async def get_list_optimized(
 
 
 def filter_projects(
-    projects: List[sly.ProjectInfo], types=[sly.ProjectType.IMAGES, sly.ProjectType.VIDEOS]
+    projects: List[sly.ProjectInfo],
+    types=[str(sly.ProjectType.IMAGES), str(sly.ProjectType.VIDEOS)],
 ):
     return [project for project in projects if project.type in types]
 
@@ -520,9 +532,9 @@ async def collect_and_copy_project_items():
                             f"Flushing buffer on project completion: buffer size = {len(project_map.buffer)}"
                         )
                         project_map.flush_buffer()
-                    logger.debug(f"Items map is saved for project ID: {project.id}")
+                    project_map.log_result()
     except Exception as e:
-        logger.error(f"Error in collect_project_items_and_move: {e}")
+        logger.error(f"Error in collect_and_copy_project_items: {e}")
         raise
 
 
@@ -625,6 +637,9 @@ def main(only_failed: bool = False):
         else:
             loop.run_until_complete(collect_and_copy_project_items())
             copy_maps_to_dst(MAPS_DIR_L, MAPS_DIR_R)
+            logger.info(
+                "Stage 1 is completed. To replace source data with the copied data, run Stage 2 script."
+            )
 
     except KeyboardInterrupt:
         logger.info("Script was stopped by the user.")

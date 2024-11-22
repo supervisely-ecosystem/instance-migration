@@ -4,18 +4,17 @@ import os
 from typing import Union
 
 import aiofiles
+import supervisely as sly
 from supervisely.api.image_api import ImageApi
 from supervisely.api.video.video_api import VideoApi
 from tenacity import before_sleep_log, retry, stop_after_attempt, wait_exponential
 from tqdm import tqdm
 
-import supervisely as sly
 from config import BUCKET_NAME, ENDPOINT_PATH, MAPS_DIR_L, SEMAPHORE_SIZE, api, logger
 
 
 def list_files_in_directory(directory: str) -> list:
-    """List all files in a directory
-    except for the ones that contain "_failed.json" in their name.
+    """List map files in a directory
 
     :param directory: Path to the directory
     :type directory: str
@@ -27,7 +26,7 @@ def list_files_in_directory(directory: str) -> list:
             os.path.join(directory, file_name)
             for file_name in os.listdir(directory)
             if os.path.isfile(os.path.join(directory, file_name))
-            and "_failed.json" not in file_name
+            # and "_failed.json" not in file_name
         ]
     except Exception as e:
         print(f"An error occurred while listing files in directory {directory}: {e}")
@@ -117,33 +116,43 @@ async def switch_files_source(project_file_path: str, semaphore: asyncio.Semapho
     :type progress: tqdm
     """
     async with semaphore:
-        entity_api = get_entity_api(project_file_path)
-        project_id = get_project_id(project_file_path)
-        items_dict = await open_json_file(project_file_path)
-
-        entity_ids = []
-        dst_paths = []
-        for entity_id, info in items_dict.items():
+        try:
+            project_id = get_project_id(project_file_path)
             try:
-                if info["status"] == "success":
-                    link: str = info["dst_path"]
-                    link = link.replace(ENDPOINT_PATH, f"fs://{BUCKET_NAME}")
-                    dst_paths.append(link)
-                    entity_ids.append(int(entity_id))
-            except Exception as e:
-                logger.warning(f"An error occurred while processing entity: {entity_id}: {e}")
+                entity_api = get_entity_api(project_file_path)
+            except ValueError as e:
+                logger.warning(
+                    f"Project ID: {project_id} has unsupported project type. Skipping. Error: {e}"
+                )
+                progress.update(1)
+                return
+            items_dict = await open_json_file(project_file_path)
 
-        if len(entity_ids) > 0:
-            for e_ids_batch, dst_paths_batch in zip(
-                sly.batched(entity_ids, batch_size=1000),
-                sly.batched(dst_paths, batch_size=1000),
-            ):
-                change_source(entity_api, e_ids_batch, dst_paths_batch)
-            logger.info(
-                f"Project ID: {project_id} completed to migrate {len(entity_ids)} entities."
-            )
-        else:
-            logger.info(f"No entities to migrate for project ID: {project_id}")
+            entity_ids = []
+            dst_paths = []
+            for entity_id, info in items_dict.items():
+                try:
+                    if info["status"] == "success":
+                        link: str = info["dst_path"]
+                        link = link.replace(ENDPOINT_PATH, f"fs://{BUCKET_NAME}")
+                        dst_paths.append(link)
+                        entity_ids.append(int(entity_id))
+                except Exception as e:
+                    logger.warning(f"An error occurred while processing entity: {entity_id}: {e}")
+
+            if len(entity_ids) > 0:
+                for e_ids_batch, dst_paths_batch in zip(
+                    sly.batched(entity_ids, batch_size=1000),
+                    sly.batched(dst_paths, batch_size=1000),
+                ):
+                    change_source(entity_api, e_ids_batch, dst_paths_batch)
+                logger.info(
+                    f"Project ID: {project_id} completed to migrate {len(entity_ids)} entities."
+                )
+            else:
+                logger.info(f"No entities to migrate for project ID: {project_id}")
+        except Exception as e:
+            logger.warning(f"Skipping project ID: {project_id} due to error: {e}")
         progress.update(1)
 
 

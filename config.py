@@ -7,7 +7,8 @@ from supervisely.sly_logger import add_default_logging_into_file
 
 api = Api.from_env()
 
-load_dotenv("1local.env")
+# TODO Uncomment the line below to use the local environment variables via the .env file.
+# load_dotenv("local.env")
 
 DEBUG_LEVEL = os.getenv("DEBUG_LEVEL", "INFO")
 
@@ -30,8 +31,19 @@ SEMAPHORE_SIZE = int(os.getenv("SEMAPHORE_SIZE", "10"))
 # Number of retries for failed items
 MAX_RETRY = int(os.getenv("MAX_RETRY", "3"))
 
-if None in [DATA_PATH, ENDPOINT_PATH, ROOT_DIR_NAME, BUCKET_NAME]:
-    raise ValueError("Some of the required environment variables are not set.")
+required_vars = {
+    "DATA_PATH": DATA_PATH,
+    "ENDPOINT_PATH": ENDPOINT_PATH,
+    "ROOT_DIR_NAME": ROOT_DIR_NAME,
+    "BUCKET_NAME": BUCKET_NAME,
+}
+
+missing_vars = [var for var, value in required_vars.items() if value is None]
+
+if missing_vars:
+    raise ValueError(
+        f"The following required environment variables are not set: {', '.join(missing_vars)}"
+    )
 
 # Local path to store project maps
 MAPS_DIR_L = os.path.join(os.getcwd(), ROOT_DIR_NAME, "maps")
