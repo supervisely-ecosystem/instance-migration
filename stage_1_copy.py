@@ -33,6 +33,8 @@ from config import (
     logger,
 )
 
+overall_failed_items_count = 0
+
 
 class HashMismatchError(Exception):
     def __init__(self, expected_hash, remote_hash):
@@ -106,6 +108,7 @@ class ProjectItemsMap:
 
     async def update_file(self, key: str, value: dict, force_flush=False):
         """Update the file with the given key and value
+
         :param key: Item ID
         :type key: str
         :param value: Item Info dict
@@ -204,7 +207,7 @@ class ProjectItemsMap:
         """
         Copy items in the dataset to the destination path and save project items mapping to the file.
         Destination path is constructed as:
-        {IM_DIR_R}/{SLYM_DIR_R}/{team_id}-{team_name}/{workspace_id}-{workspace_name}/{project_id}-{project_name}/{dataset_id}-{dataset_name}/{item_id}-{item_name}
+        {ENDPOINT_PATH}/{ROOT_DIR_NAME}/{team_id}-{team_name}/{workspace_id}-{workspace_name}/{project_id}-{project_name}/{dataset_id}-{dataset_name}/{item_id}-{item_name}
 
         :param dataset: Dataset dict with path and info
         :type dataset: dict
@@ -485,6 +488,7 @@ async def collect_and_copy_project_items():
     """Collect information about all instance project items and copy them to destination path.
     Files will be stored in the human-readable structure.
     """
+    global overall_failed_items_count
     try:
         teams = api.team.get_list()
         for team in tqdm(teams, desc="Teams"):
@@ -533,6 +537,7 @@ async def collect_and_copy_project_items():
                         )
                         project_map.flush_buffer()
                     project_map.log_result()
+                    overall_failed_items_count += len(project_map.failed_items)
     except Exception as e:
         logger.error(f"Error in collect_and_copy_project_items: {e}")
         raise
@@ -637,9 +642,15 @@ def main(only_failed: bool = False):
         else:
             loop.run_until_complete(collect_and_copy_project_items())
             copy_maps_to_dst(MAPS_DIR_L, MAPS_DIR_R)
-            logger.info(
-                "Stage 1 is completed. To replace source data with the copied data, run Stage 2 script."
-            )
+            if overall_failed_items_count > 0:
+                logger.warning(
+                    f"Stage 1 is completed. Failed items: {overall_failed_items_count}. "
+                    "To retry processing failed items, run the script again."
+                )
+            else:
+                logger.info(
+                    "Stage 1 is completed. To replace source data with the copied data, run Stage 2 script."
+                )
 
     except KeyboardInterrupt:
         logger.info("Script was stopped by the user.")
