@@ -11,6 +11,7 @@ Ensure you have the necessary environment variables set before running the scrip
    pip install -r requirements.txt
    ```
 3. Environment variables set in your system or you can manually set them in `local.env`.
+4. You must have administrator rights on Supervisely instance
 
 ## Environment Variables
 
@@ -21,6 +22,8 @@ Ensure you have the necessary environment variables set before running the scrip
 - `BUCKET_NAME`: Bucket name. Look for it in Instance Settings -> Cloud Credentials.
 - `SEMAPHORE_SIZE`: Number of concurrent tasks to run in parallel. It will help to communicate with the Supervisely API properly.
 - `MAX_RETRY`: Number of retries for failed items.
+
+Don't forget to set envs to authenticate with the Supervisely API. [Learn more](https://developer.supervisely.com/getting-started/basics-of-authentication)
 
 ## Stage 1: Data Copying
 
@@ -35,6 +38,8 @@ The Stage 1 script collects data for items in projects for all teams and copies 
 For example: `/home/user/NAS/migrated/1-Main/1-Test/222-Test_project/333-ds01/12345-lemons.jpg`
 
 ### Usage
+
+Uncomment line 11 in `local.env` if you would like to use it.
 
 ```sh
 python3 stage_1_copy.py
