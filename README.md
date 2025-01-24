@@ -17,13 +17,17 @@ Ensure you have the necessary environment variables set before running the scrip
 
 -   `LOG_LEVEL`: Logging level (e.g., DEBUG, INFO, WARNING).
 -   `DATA_PATH`: Path to the directory with the data on the local machine where the instance is running.
--   `ENDPOINT_PATH`: "fs endpoint" must be mounted to the same machine where the instance is running. Look for it in Instance Settings -> Cloud Credentials.
--   `ROOT_DIR_NAME`: Root directory name, where all the data will be stored during the Stage 1.
+-   `ENDPOINT_PATH`: "fs endpoint" must be mounted to the same machine where the instance is running. Look for it in Instance Settings -> Cloud Credentials. The number `4` is in the picture below.
+-   `ROOT_DIR_NAME`: Root directory name, where all the data will be stored during the Stage 1. The number `5` is in the picture below.
 -   `BUCKET_NAME`: Bucket name. Look for it in Instance Settings -> Cloud Credentials.
 -   `SEMAPHORE_SIZE`: Number of concurrent tasks to run in parallel. It will help to communicate with the Supervisely API properly.
 -   `MAX_RETRY`: Number of retries for failed items.
 
+  ![Environments](https://github.com/user-attachments/assets/be4e80c8-e38b-490f-8ef3-07304a5470b1)
+  
 Don't forget to set envs to authenticate with the Supervisely API. [Learn more](https://developer.supervisely.com/getting-started/basics-of-authentication)
+
+
 
 ## Stage 1: Data Copying
 
