@@ -24,8 +24,18 @@ Ensure you have the necessary environment variables set before running the scrip
 -   `MAX_RETRY`: Number of retries for failed items.
 
   ![Environments](https://github.com/user-attachments/assets/be4e80c8-e38b-490f-8ef3-07304a5470b1)
-  
-Don't forget to set envs to authenticate with the Supervisely API. [Learn more](https://developer.supervisely.com/getting-started/basics-of-authentication)
+
+### Using a Local Environment File
+
+If you want to use the `local.env` file with predefined environment variables, you should uncomment the line in `config.py` responsible for loading these variables:
+
+```python
+# load_dotenv("local.env")
+```
+
+### API Authentication
+
+☝️ Don't forget to set envs to authenticate with the Supervisely API. [Learn more](https://developer.supervisely.com/getting-started/basics-of-authentication)
 
 
 
