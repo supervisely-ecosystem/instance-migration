@@ -42,7 +42,8 @@ missing_vars = [var for var, value in required_vars.items() if value is None]
 
 if missing_vars:
     raise ValueError(
-        f"The following required environment variables are not set: {', '.join(missing_vars)}"
+        f"The following required environment variables are not set: {', '.join(missing_vars)}. "
+        "If you are using the 'local.env' file, make sure the line loading envs from this file is uncommented in config.py."
     )
 
 # Local path to store project maps
